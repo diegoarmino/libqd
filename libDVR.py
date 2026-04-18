@@ -462,6 +462,321 @@ def generate_energy_difference_table(sim_data, N_states=20, filename="energy_dif
 
     return styled_table
 
+# ====================================================================
+# 1. GENERATE LINEAR COMBINATIONS
+# ====================================================================
+def create_state_vector(sim_data, coeff_dict):
+    """
+    Creates a full coefficient array from a simple dictionary.
+    Example: {0: np.cos(theta), 1: np.sin(theta)} for c_0|0> + c_1|1>
+    """
+    num_states = sim_data['num_states']
+    coeffs = np.zeros(num_states, dtype=np.complex128)
+
+    for idx, amp in coeff_dict.items():
+        if idx < num_states:
+            coeffs[idx] = amp
+        else:
+            print(f"Warning: State {idx} is not in the loaded dataset.")
+
+    # Normalize automatically to prevent probability > 1
+    norm = np.linalg.norm(coeffs)
+    if norm > 0:
+        coeffs /= norm
+
+    return coeffs
+
+def get_spatial_wavefunction(sim_data, coeffs):
+    """
+    1. Generates the 2D spatial wavefunction from a coefficient array.
+       ψ(x1, x2) = Σ c_n * φ_n(x1, x2)
+    """
+    wavefuncs = sim_data['wavefunctions']
+    # Tensordot smoothly multiplies the 1D coefficients against the 3D wavefunctions array
+    psi_2d = np.tensordot(coeffs, wavefuncs, axes=([0], [0]))
+    return psi_2d
+
+
+# ====================================================================
+# 2. PLOT DENSITY
+# ====================================================================
+def plot_density(sim_data, psi_2d, title="State Density $|\psi|^2$", xlim=(-1.0, 4.0), ylim=(-1.0, 4.0)):
+    """
+    2. Plots the probability density of any given 2D wavefunction.
+    """
+    X1, X2, V, De = sim_data['X1'], sim_data['X2'], sim_data['V'], sim_data['De']
+    density = np.abs(psi_2d)**2
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+
+    # Background potential contours
+    levels = np.linspace(0, De, 10)
+    ax.contour(X1, X2, V, levels=levels, colors='white', alpha=0.3, linewidths=0.5)
+
+    # Wavefunction density
+    im = ax.imshow(density, extent=[X1.min(), X1.max(), X2.min(), X2.max()],
+                   origin='lower', cmap='magma', aspect='auto')
+
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("$x_1$", fontsize=12)
+    ax.set_ylabel("$x_2$", fontsize=12)
+
+    if xlim: ax.set_xlim(xlim)
+    if ylim: ax.set_ylim(ylim)
+
+    fig.colorbar(im, ax=ax, label="Probability Density")
+    plt.tight_layout()
+    plt.show()
+    return fig
+
+
+# ====================================================================
+# 3. TIME EVOLUTION
+# ====================================================================
+def evolve_coefficients(sim_data, coeffs_0, t):
+    """
+    3. Evolves the quantum state purely algebraically (Zero Trotter error).
+       c_n(t) = c_n(0) * e^{-i * E_n * t} (atomic units, hbar=1)
+    """
+    energies = sim_data['energies']
+    phases = np.exp(-1j * energies * t)
+    return coeffs_0 * phases
+
+def get_evolved_wavefunction(sim_data, coeffs_0, t):
+    """
+    Evolves the state and returns the 2D spatial representation at time t.
+    """
+    coeffs_t = evolve_coefficients(sim_data, coeffs_0, t)
+    return get_spatial_wavefunction(sim_data, coeffs_t)
+
+
+# ====================================================================
+# 4. BUILD OBSERVABLE MATRIX
+# ====================================================================
+def build_observable_matrix(sim_data, observable_func, E_cutoff=None):
+    """
+    4. Builds the matrix representation of an observable O(x1, x2) in the eigenbasis.
+       Only includes states with Energy < E_cutoff.
+
+       observable_func: A function that takes (X1, X2) grids and returns O_grid.
+    """
+    energies = sim_data['energies']
+    wavefuncs = sim_data['wavefunctions']
+    X1, X2 = sim_data['X1'], sim_data['X2']
+
+    if E_cutoff is None:
+        E_cutoff = sim_data['De']  # Default: Dissociation Limit
+
+    valid_indices = np.where(energies <= E_cutoff)[0]
+    n_valid = len(valid_indices)
+
+    print(f"Building {n_valid}x{n_valid} observable matrix (E_cutoff = {E_cutoff:.4f})...")
+
+    # Evaluate the observable on the spatial grid
+    O_grid = observable_func(X1, X2)
+
+    # Initialize Hermitian matrix
+    O_mat = np.zeros((n_valid, n_valid), dtype=np.complex128)
+
+    for i, idx_i in enumerate(valid_indices):
+        psi_i = wavefuncs[idx_i]
+        for j in range(i, n_valid):  # Exploit Hermiticity
+            idx_j = valid_indices[j]
+            psi_j = wavefuncs[idx_j]
+
+            # DVR integration: sum( psi_i^* * O * psi_j )
+            val = np.sum(np.conj(psi_i) * O_grid * psi_j)
+
+            O_mat[i, j] = val
+            if i != j:
+                O_mat[j, i] = np.conj(val)
+
+    return O_mat, valid_indices
+
+
+# ====================================================================
+# 5. CALCULATE OBSERVABLE MATRIX ELEMENT
+# ====================================================================
+def calc_observable_element(psi1_2d, psi2_2d, observable_grid=None):
+    """
+    5. Calculates <psi1 | O | psi2> for any two 2D spatial wavefunctions.
+       If observable_grid is None, it calculates the overlap <psi1 | psi2>.
+    """
+    if observable_grid is None:
+        return np.sum(np.conj(psi1_2d) * psi2_2d)
+    else:
+        return np.sum(np.conj(psi1_2d) * observable_grid * psi2_2d)
+
+
+# ====================================================================
+# 6. AUTOCORRELATION & FOURIER TRANSFORM
+# ====================================================================
+def calc_autocorrelation_fft(sim_data, coeffs_0, t_max, dt):
+    """
+    6. Calculates the Autocorrelation function C(t) = <psi(0)|psi(t)>
+       and its Fourier Transform to yield the energy spectrum.
+    """
+    energies = sim_data['energies']
+    t_array = np.arange(0, t_max, dt)
+
+    # Algebraically, C(t) = sum_n |c_n|^2 e^{-i E_n t}
+    probabilities = np.abs(coeffs_0)**2
+
+    # Vectorized computation of C(t)
+    phase_matrix = np.exp(-1j * np.outer(energies, t_array))
+    C_t = np.dot(probabilities, phase_matrix)
+
+    # Apply a Hanning window to prevent spectral leakage from finite t_max
+    window = np.hanning(len(C_t))
+    C_t_windowed = C_t * window
+
+    # Calculate the Fourier Transform
+    spectrum = np.fft.fft(C_t_windowed)
+
+    # Get physical angular frequencies: w = E/hbar (where hbar = 1)
+    # np.fft.fftfreq returns cycles per time unit, so we multiply by 2*pi for angular freq.
+    freqs = np.fft.fftfreq(len(t_array), d=dt) * (2 * np.pi)
+
+    # Shift so frequencies are linearly ordered
+    spectrum_shifted = np.fft.fftshift(spectrum)
+    freqs_shifted = np.fft.fftshift(freqs)
+
+    return t_array, C_t, freqs_shifted, np.abs(spectrum_shifted)
+
+import numpy as np
+
+# ====================================================================
+# 7. EXPAND ARBITRARY STATE IN EIGENBASIS
+# ====================================================================
+def expand_state_in_eigenbasis(sim_data, psi_arbitrary):
+    """
+    Projects an arbitrary 2D spatial wavefunction into the DVR eigenbasis.
+    Returns the complex coefficient array `coeffs`.
+    """
+    # 1. Ensure the arbitrary state is properly normalized on the DVR grid
+    norm_grid = np.sqrt(np.sum(np.abs(psi_arbitrary)**2))
+    if norm_grid > 0:
+        psi_norm = psi_arbitrary / norm_grid
+    else:
+        psi_norm = psi_arbitrary
+
+    wavefuncs = sim_data['wavefunctions']
+
+    # 2. Calculate overlap <phi_n | psi_arbitrary> for all n
+    # tensordot efficiently computes np.sum(conj(phi_n) * psi) across the 2D grid
+    coeffs = np.tensordot(np.conj(wavefuncs), psi_norm, axes=([1, 2], [0, 1]))
+
+    # 3. Quality Check: Does our finite basis set cover the entire state?
+    represented_prob = np.sum(np.abs(coeffs)**2)
+    print(f"Projection complete. The finite eigenbasis captures {represented_prob*100:.4f}% of the state's probability.")
+    if represented_prob < 0.95:
+        print("WARNING: Significant probability is lost. The arbitrary state has high-energy components that exceed your computed 'num_states'.")
+
+    # Re-normalize the coefficients to exactly 1.0 to conserve probability in our sub-space
+    if np.linalg.norm(coeffs) > 0:
+        coeffs /= np.linalg.norm(coeffs)
+
+    return coeffs
+
+
+# ====================================================================
+# 8. ALGEBRAIC TIME EVOLUTION OF AN OBSERVABLE
+# ====================================================================
+def calc_observable_time_evolution(sim_data, coeffs_0, O_mat, valid_indices, t_array):
+    """
+    Calculates the expectation value <O(t)> algebraically over time.
+    This is orders of magnitude faster than doing spatial integration at every time step.
+
+    O_mat, valid_indices: Returned by build_observable_matrix()
+    """
+    energies = sim_data['energies'][valid_indices]
+    coeffs_valid = coeffs_0[valid_indices]
+
+    # 1. Evolve the coefficients: c_n(t) = c_n(0) * exp(-i E_n t)
+    # phase_matrix shape: (len(t_array), num_valid_states)
+    phases = np.exp(-1j * np.outer(t_array, energies))
+    coeffs_t = coeffs_valid * phases
+
+    # 2. Calculate expectation value: <O(t)> = conj(c(t)) @ O_mat @ c(t)
+    # Vectorized for all time steps at once
+    right_vecs = np.dot(coeffs_t, O_mat.T)
+    expected_values = np.sum(np.conj(coeffs_t) * right_vecs, axis=1)
+
+    # Observables are Hermitian, so the result is purely real
+    return np.real(expected_values)
+
+
+# ====================================================================
+# 9. GENERATE DISPLACED INITIAL STATE (SOFT METHOD)
+# ====================================================================
+def generate_soft_initial_state(sim_data, d1=1.0, d2=0.0, use_dvr_ground_state=True, itp_steps=300, dtau=0.05):
+    """
+    Generates an initial state by displacing the ground state via FFT, 
+    mimicking the Split-Operator Fourier Transform (SOFT) method.
+    
+    Parameters:
+    - sim_data: The dictionary loaded from the DVR HDF5 file.
+    - d1, d2: Displacement amounts along x1 and x2.
+    - use_dvr_ground_state: If True, skips ITP and displaces the exact DVR ground state.
+    - itp_steps, dtau: Parameters for Imaginary Time Propagation (if used).
+    """
+    print(f"--- Generating SOFT Initial State (Displacement: d1={d1}, d2={d2}) ---")
+
+    # Extract grids and parameters directly from DVR data to ensure perfect overlap
+    X1, X2 = sim_data['X1'], sim_data['X2']
+    N = sim_data['N']
+    dx = sim_data['dx']
+    m = sim_data['m']
+    De = sim_data['De']
+    a = sim_data['a']
+    lam = sim_data['lam']
+
+    # 1. Setup Momentum Grids
+    p = np.fft.fftfreq(N, d=dx) * 2 * np.pi
+    P1, P2 = np.meshgrid(p, p, indexing='ij') # Critical: matching 'ij' indexing from DVR
+
+    # 2. Obtain the Ground State
+    if use_dvr_ground_state:
+        print("  Using exact DVR ground state...")
+        psi_GS = sim_data['wavefunctions'][0].astype(np.complex128)
+        
+    else:
+        print("  Finding ground state via Imaginary Time Propagation...")
+        # Setup Hamiltonian potentials (Matching DVR sign: - lam*y1*y2)
+        Y1 = 1.0 - np.exp(-a * X1)
+        Y2 = 1.0 - np.exp(-a * X2)
+        V = De * Y1**2 + De * Y2**2 - lam * Y1 * Y2
+        T = (P1**2 + P2**2) / (2.0 * m)
+
+        # Initial guess: Gaussian centered at origin
+        psi_itp = np.exp(-(X1**2 + X2**2)).astype(np.complex128)
+        psi_itp /= np.linalg.norm(psi_itp) # Discrete unit norm for DVR compatibility
+
+        U_V_itp = np.exp(-V * dtau / 2.0)
+        U_T_itp = np.exp(-T * dtau)
+
+        for _ in range(itp_steps):
+            psi_itp *= U_V_itp
+            psi_p = np.fft.fft2(psi_itp)
+            psi_p *= U_T_itp
+            psi_itp = np.fft.ifft2(psi_p) * U_V_itp
+            
+            # Normalize at each step to prevent collapsing to zero
+            psi_itp /= np.linalg.norm(psi_itp) 
+
+        psi_GS = psi_itp
+
+    # 3. Displace the Ground State (Spatial Translation via Momentum Shift)
+    print("  Applying spatial displacement via momentum shift operator...")
+    psi_p_GS = np.fft.fft2(psi_GS)
+    shift_operator = np.exp(-1j * (P1 * d1 + P2 * d2))
+    psi_displaced = np.fft.ifft2(psi_p_GS * shift_operator)
+
+    # Ensure absolute discrete normalization before returning
+    psi_displaced /= np.linalg.norm(psi_displaced)
+
+    return psi_displaced
+
 # ===================
 # Run the calculation 
 # ===================
