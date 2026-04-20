@@ -340,7 +340,7 @@ def plot_eigenstates_polyads(sim_data, num_polyads=5, xlim=(-1.0, 4.0), ylim=(-1
 
                 # Plot wavefunction density
                 density = np.abs(wavefuncs[state_idx])**2
-                ax.imshow(density, extent=[X1.min(), X1.max(), X2.min(), X2.max()],
+                ax.imshow(density.T, extent=[X1.min(), X1.max(), X2.min(), X2.max()],
                           origin='lower', cmap='magma', aspect='auto')
 
                 # 3. Fine-tuned Typography (Fixes text and tick overlapping)
@@ -500,7 +500,7 @@ def get_spatial_wavefunction(sim_data, coeffs):
 # ====================================================================
 # 2. PLOT DENSITY
 # ====================================================================
-def plot_density(sim_data, psi_2d, title="State Density $|\psi|^2$", xlim=(-1.0, 4.0), ylim=(-1.0, 4.0)):
+def plot_density(sim_data, psi_2d, title="State Density $|\\psi|^2$", xlim=(-1.0, 4.0), ylim=(-1.0, 4.0)):
     """
     2. Plots the probability density of any given 2D wavefunction.
     """
@@ -514,7 +514,7 @@ def plot_density(sim_data, psi_2d, title="State Density $|\psi|^2$", xlim=(-1.0,
     ax.contour(X1, X2, V, levels=levels, colors='white', alpha=0.3, linewidths=0.5)
 
     # Wavefunction density
-    im = ax.imshow(density, extent=[X1.min(), X1.max(), X2.min(), X2.max()],
+    im = ax.imshow(density.T, extent=[X1.min(), X1.max(), X2.min(), X2.max()],
                    origin='lower', cmap='magma', aspect='auto')
 
     ax.set_title(title, fontsize=14)
@@ -777,6 +777,172 @@ def generate_soft_initial_state(sim_data, d1=1.0, d2=0.0, use_dvr_ground_state=T
 
     return psi_displaced
 
+# ====================================================================
+# 10. BUILD PARTIAL HAMILTONIAN MATRIX (H1 or H2)
+# ====================================================================
+def build_partial_hamiltonian_matrix(sim_data, oscillator=1, E_cutoff=None):
+    """
+    Correctly calculates the matrix <psi_i | H_local | psi_j>
+    by applying the exact DVR kinetic energy matrix.
+
+    oscillator: 1 (for H1 = T1 + V1) or 2 (for H2 = T2 + V2)
+    """
+    energies = sim_data['energies']
+    wavefuncs = sim_data['wavefunctions']
+    N = sim_data['N']
+    dx = sim_data['dx']
+    m = sim_data['m']
+    De = sim_data['De']
+    a = sim_data['a']
+    X1, X2 = sim_data['X1'], sim_data['X2']
+
+    # 1. Rebuild the exact 1D DVR Kinetic Energy Matrix
+    i, j = np.meshgrid(np.arange(N), np.arange(N), indexing='ij')
+    diff = np.abs(i - j)
+    diff[diff == 0] = 1 # Prevent division by zero
+    sign = np.where(diff % 2 == 0, 1.0, -1.0)
+
+    T1D = 2.0 * sign / (diff**2)
+    np.fill_diagonal(T1D, (np.pi**2) / 3.0)
+    T1D *= (1.0**2) / (2.0 * m * dx**2)  # hbar = 1.0
+
+    # 2. Local Potential
+    if oscillator == 1:
+        V_local = De * (1.0 - np.exp(-a * X1))**2
+    else:
+        V_local = De * (1.0 - np.exp(-a * X2))**2
+
+    # 3. Filter valid states
+    if E_cutoff is None:
+        E_cutoff = De
+    valid_indices = np.where(energies <= E_cutoff)[0]
+    n_valid = len(valid_indices)
+
+    print(f"Building {n_valid}x{n_valid} partial Hamiltonian matrix for Oscillator {oscillator}...")
+    H_local_mat = np.zeros((n_valid, n_valid), dtype=np.complex128)
+
+    for i, idx_i in enumerate(valid_indices):
+        psi_i = wavefuncs[idx_i]
+        for j in range(i, n_valid):
+            idx_j = valid_indices[j]
+            psi_j = wavefuncs[idx_j]
+
+            # Apply Kinetic Energy Matrix
+            if oscillator == 1:
+                # T1 acts on x1 (axis 0). Matrix multiply T1D along axis 0.
+                T_psi_j = T1D @ psi_j
+            else:
+                # T2 acts on x2 (axis 1). Matrix multiply T1D along axis 1.
+                T_psi_j = psi_j @ T1D
+
+            # Apply Potential Energy
+            V_psi_j = V_local * psi_j
+
+            # Total action: H_local |psi_j>
+            H_psi_j = T_psi_j + V_psi_j
+
+            # Integrate: <psi_i | H_local | psi_j>
+            val = np.sum(np.conj(psi_i) * H_psi_j)
+
+            H_local_mat[i, j] = val
+            if i != j:
+                H_local_mat[j, i] = np.conj(val)
+
+    return H_local_mat, valid_indices
+
+# ====================================================================
+# 11. PRINT HAMILTONIAN MATRIX 
+# ====================================================================
+def print_matrix(matrix, valid_indices, title="Matrix", max_size=10):
+    """
+    Prints a complex or real matrix in a beautifully formatted table using pandas.
+    Limits the printout to the first `max_size` states for readability.
+    """
+    # Truncate for display purposes
+    n_display = min(len(valid_indices), max_size)
+    display_mat = matrix[:n_display, :n_display]
+    display_idx = valid_indices[:n_display]
+
+    # Check if the matrix is purely real (Hamiltonians in this basis should be)
+    if np.max(np.abs(np.imag(display_mat))) < 1e-10:
+        display_mat = np.real(display_mat)
+
+    # Create labels like "|0>", "|1>"
+    labels =[f"|{idx}⟩" for idx in display_idx]
+
+    # Create a DataFrame
+    df = pd.DataFrame(display_mat, index=labels, columns=labels)
+
+    print(f"\n{'='*50}")
+    print(f" {title} (Showing first {n_display}x{n_display})")
+    print(f"{'='*50}")
+
+    # Force pandas to print cleanly, overriding terminal width limits
+    with pd.option_context('display.float_format', '{: .6f}'.format,
+                           'display.max_columns', None,
+                           'display.width', 1000):
+        print(df)
+    print("="*50 + "\n")
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def diagnose_eigenstate_symmetry(sim_data, states_to_check=[1, 2, 3, 4, 6, 7]):
+    """
+    Diagnoses whether states are Symmetric or Antisymmetric, 
+    and checks the sign of the wavefunction on the x1 axis.
+    """
+    wavefuncs = sim_data['wavefunctions']
+    X1, X2 = sim_data['X1'], sim_data['X2']
+    
+    print(f"{'State':<6} | {'Parity (S/A)':<15} | {'Sign on x1 axis':<15}")
+    print("-" * 42)
+    
+    for idx in states_to_check:
+        psi = wavefuncs[idx]
+        
+        # 1. Calculate Exchange Parity: <psi | P_12 | psi>
+        # Transposing the 2D matrix perfectly swaps x1 and x2
+        psi_swapped = np.transpose(psi) 
+        parity = np.sum(psi * psi_swapped)
+        
+        if parity > 0.5:
+            sym_label = "Symmetric (+1)"
+        elif parity < -0.5:
+            sym_label = "Antisymmetric (-1)"
+        else:
+            sym_label = "Mixed / Other"
+            
+        # 2. Check the "Lobe Phase" along the x1 axis
+        # We sample the wavefunction where x1 is large and x2 is near the equilibrium (minimum)
+        # Find index where x2 is closest to 0 (equilibrium of ground state)
+        x2_eq_idx = np.argmin(np.abs(X2[0, :] - 0.0))
+        
+        # Sum the wavefunction along the x1 axis at the x2 equilibrium
+        lobe_integral = np.sum(psi[:, x2_eq_idx])
+        
+        if lobe_integral > 0:
+            phase_label = "Positive (+)"
+        else:
+            phase_label = "Negative (-)"
+            
+        print(f"|{idx}⟩    | {sym_label:<15} | {phase_label:<15}")
+
+def plot_wavefunction_phase(sim_data, state_idx):
+    psi = sim_data['wavefunctions'][state_idx]
+    X1, X2 = sim_data['X1'], sim_data['X2']
+
+    # Use a diverging colormap centered at zero
+    vmax = np.max(np.abs(psi))
+    plt.figure(figsize=(5,4))
+    plt.contour(X1, X2, sim_data['V'], levels=10, colors='black', alpha=0.2)
+    plt.imshow(psi.T, extent=[X1.min(), X1.max(), X2.min(), X2.max()],
+               origin='lower', cmap='RdBu', vmin=-vmax, vmax=vmax)
+    plt.title(f"State |{state_idx}⟩ Wavefunction Phase")
+    plt.colorbar(label="Amplitude (Red=+, Blue=-)")
+    plt.show()
+
+
 # ===================
 # Run the calculation 
 # ===================
@@ -814,13 +980,67 @@ data = load_eigenstates(h5_filename)
 
 # 2. Plot the first 7 Polyads (this will plot 28 states in a beautiful triangle)
 # You can easily change xlim and ylim here!
-fig = plot_eigenstates_polyads(data, num_polyads=7, xlim=(-1.0, 4.0), ylim=(-1.0, 4.0))
+#fig = plot_eigenstates_polyads(data, num_polyads=7, xlim=(-1.0, 4.0), ylim=(-1.0, 4.0))
 
 # 3. Generate the Energy Differences Table (First 20 states)
-table = generate_energy_difference_table(data, N_states=20, filename="energy_differences.html")
-
-# (Optional) Display in Colab directly
-#display(table)
+#table = generate_energy_difference_table(data, N_states=20, filename="energy_differences.html")
 
 # Print the first 10 polyads to the terminal
 print_eigenenergies_by_polyad(data, max_polyads=5)
+
+# 1. Load your DVR data
+# data = load_eigenstates("morse_eigenstates_50states.h5")
+
+# 2. Generate the displaced SOFT state
+# (Rigid spatial displacement, purely geometric)
+psi_soft = generate_soft_initial_state(data, d1=0.25, d2=0.00, use_dvr_ground_state=True)
+
+# 3. Project it into your DVR eigenbasis
+# This gives you the c_n coefficients!
+coeffs_soft = expand_state_in_eigenbasis(data, psi_soft)
+
+# 4. Check what states the SOFT method actually populated!
+print("\nTop 8 populated states in the SOFT initial state:")
+print(f"| Polyad   | Probabilities | Coefficients |")
+print(f"| :---: | :---: | :---: |")
+probabilities = np.abs(coeffs_soft)**2
+top_states = np.argsort(probabilities)[::-1][:8]
+top_coeffs = np.argsort(coeffs_soft)[::-1][:8]
+for state_idx in top_states:
+    #print(f"|{state_idx}⟩ : P = {probabilities[state_idx]:.6f}")
+    print(f"| {state_idx} | {probabilities[state_idx]:.2f} | {coeffs_soft[state_idx]:.2f} |")
+
+
+# DIAGNOSE PHASE AND PARITY PROBLEMS IN EIGENSTAES 
+# (DVR eigensolver possible assigning random phases to eigenstaes)
+#-------------------------------------------------------------------------------
+#diagnose_eigenstate_symmetry(data, states_to_check=[1, 2, 3, 4, 6, 7, 10, 11])
+
+# Run it on the suspect states
+#plot_wavefunction_phase(data, 1)
+#plot_wavefunction_phase(data, 2)
+#plot_wavefunction_phase(data, 3)
+#plot_wavefunction_phase(data, 4)
+
+# Build a symmetric linear combination of states and plot the result to check if 
+# the resulting state is excited along the correct bond.
+
+#coeff_dict = {6:-1/np.sqrt(2), 7:-1/np.sqrt(2)}
+#coeffs = create_state_vector(data, coeff_dict)
+#state = get_spatial_wavefunction(data, coeffs)
+#plot_density(data, state, title="SOFT Displaced Ground State")
+#-------------------------------------------------------------------------------
+
+
+# 5. Plot the initial state to verify
+#plot_density(data, psi_soft, title="SOFT Displaced Ground State")
+
+# 6. Calculate Matrix representation of H_1
+# E.g., The expectation value of position x1
+# 2. Build the Partial Hamiltonian for Oscillator 1
+H1_mat, valid_idx = build_partial_hamiltonian_matrix(data, oscillator=1, E_cutoff=data['De'])
+
+# 3. Print the matrix format (showing the top 8x8 block for readability)
+print_matrix(H1_mat, valid_idx, title="Partial Hamiltonian <i| H_1 |j>", max_size=8)
+
+
